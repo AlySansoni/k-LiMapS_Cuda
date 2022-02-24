@@ -5,17 +5,17 @@
 #include <math.h>
 #include <cuda.h>
 #include <curand_kernel.h>
-#include "utils/common.h"
+#include "../utils/common.h"
+#include <gsl/gsl_blas.h>
+#include <gsl/gsl_linalg.h>
 #include <thrust/device_vector.h>
-#include <cusolverDn.h>
 #include <cuda_runtime_api.h>
-#include "utilities.cuh"
 
 typedef float realtype;
 
 #define N 600
 #define M 700
-#define K 10
+#define K 32
 #define SHAREDBLOCKSIZE 16
 #define NSTREAM 8
 
@@ -24,9 +24,7 @@ typedef float realtype;
 
 #define SEED time(NULL)
 
-
 #define MAXITER 1000
-
 
 __host__ void matrixDisplay (float *arr1, int row, int col){
  
@@ -42,7 +40,7 @@ __global__ void rand_gen_gpu(float *dict, curandState *states, int nRows, int nC
 
     unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
     unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-        
+
     if (y < nRows && x < nCols)
         curand_init(y*nCols+x, 0, 0, &states[y*nCols+x]);
         dict[y*nCols+x] = curand_normal_double(&states[y*nCols+x]);
@@ -80,13 +78,14 @@ __host__ float euclNorm(float *arr, int dim){
 
 __global__ void transposeSmem(float *in, float *out, int nrows, int ncols) {
 
-    extern __shared__ float tile[];
+    __shared__ float tile[SHAREDBLOCKSIZE][SHAREDBLOCKSIZE];
 
     unsigned int row = blockDim.y * blockIdx.y + threadIdx.y;
     unsigned int col = blockDim.x * blockIdx.x + threadIdx.x;
-
+    // from global to shared memory
     if (row < nrows && col < ncols)
-        tile[threadIdx.y*blockDim.y+threadIdx.x] = in[row*ncols+col];
+        tile[threadIdx.y][threadIdx.x] = in[row*ncols+col];
+    // thread synchronization
     __syncthreads();
 
     // transposed block offset
@@ -94,7 +93,7 @@ __global__ void transposeSmem(float *in, float *out, int nrows, int ncols) {
     int x = blockIdx.y * blockDim.y + threadIdx.x;
     // switched controls
     if (y < ncols && x < nrows)
-        out[y*nrows + x] = tile[threadIdx.x*blockDim.x+threadIdx.y];
+        out[y*nrows + x] = tile[threadIdx.x][threadIdx.y];
 
 }
 
@@ -182,7 +181,6 @@ __global__ void copy_matrix(float *src, float *dest, int nRows, int nCols, uint 
         dest[id_elem] = src[id_elem];
 }
 
-
 __global__ void array_initialize(float *tmp_lambaMat, float lambda, int dim, uint offset){
 
     int i = offset+blockDim.x * blockIdx.x + threadIdx.x;
@@ -195,16 +193,12 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
     
     dim3 blockShared(SHAREDBLOCKSIZE, SHAREDBLOCKSIZE);
     dim3 gridShared;
-	uint SMEMsize = SHAREDBLOCKSIZE *SHAREDBLOCKSIZE;
-	uint SMEMbyte = 2 * SMEMsize * sizeof(float);
-
 
     const realtype rcond = 1E-15;
 
     unsigned int n = dim1;
     unsigned int m = dim2;
     float *V, *Sigma_pinv, *U;
-    float *tmp_U;
     float *_tmp_mat;
     float *s;
     int i;
@@ -220,10 +214,9 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
     dim3 block(blockSize, blockSize);
 	dim3 grid1((m + block.x - 1) / block.x, (n + block.y - 1) / block.y);
     dim3 grid2((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
-
+  
     for (int i = 0; i < NSTREAM; ++i)
         CHECK(cudaStreamCreate(&stream[i]));
-        //CHECK(cudaStreamCreateWithFlags(&stream[i],cudaStreamNonBlocking));
    
     int iElem =  ((m*n)%NSTREAM == 0) ? (m*n)/NSTREAM : (m*n)/ NSTREAM+1;
     dim3 grid1St ((iElem/m+ blockShared.x - 1) / blockShared.x, (iElem/n + blockShared.y - 1) / blockShared.y);
@@ -235,15 +228,15 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
         CHECK(cudaMallocManaged(&_tmp_mat, m*n*sizeof(float)));
         gridShared.y = (n + blockShared.y - 1) / blockShared.y;
         gridShared.x = (m+blockShared.x - 1) / blockShared.x;
-        
-        transposeSmem<<<gridShared, blockShared, SMEMbyte>>>(src, _tmp_mat, n, m);
-       
-        CHECK(cudaDeviceSynchronize());
 
+        transposeSmem<<<gridShared, blockShared>>>(src, _tmp_mat, n, m); 
+        CHECK(cudaDeviceSynchronize());
+        
         for (int z=0; z< NSTREAM; z++){
             int ioffset = z*iElem;
             copy_matrix<<<grid2St, blockShared, 0, stream[z]>>>(_tmp_mat,src,m,n,ioffset);
         }    
+
         CHECK(cudaDeviceSynchronize());
 
 		i = m;
@@ -254,44 +247,44 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
     if (was_swapped)
         CHECK(cudaFree(_tmp_mat));
 
-     /* do SVD */
+    /* do SVD */
     CHECK(cudaMallocManaged(&V,m*m*sizeof(float)));
     CHECK(cudaMallocManaged(&s,m*sizeof(float)));
-    CHECK(cudaMallocManaged(&tmp_U,n*m*sizeof(float)));
-    CHECK(cudaMallocManaged(&U,n*n*sizeof(float)));
 
-    int work_size = 0;
-    int *devInfo;          
-    CHECK(cudaMallocManaged(&devInfo,sizeof(int)));
-    const cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR; // compute eigenvectors.
-    const int econ = 1 ; 
-
-    cusolverDnHandle_t solver_handle;
-    gesvdjInfo_t gesvdj_params;
-    cusolverDnCreate(&solver_handle);
-    cusolverDnCreateGesvdjInfo(&gesvdj_params);
-    // --- CUDA SVD initialization
-    cusolveSafeCall(cusolverDnSgesvdj_bufferSize(solver_handle, jobz,econ,n, m, src, n,s,tmp_U,n,V,m,&work_size, gesvdj_params));
-
-    float *work;   
-    CHECK(cudaMallocManaged(&work, work_size * sizeof(float)));
-    // --- CUDA SVD execution
-    cusolveSafeCall(cusolverDnSgesvdj(solver_handle, jobz, econ , n, m, src, n, s, tmp_U,n , V, m, work, work_size, devInfo, gesvdj_params));
-    CHECK(cudaDeviceSynchronize());
-
-    for(int i = 0; i<n; i++){
-        for(int j=0; j<m; j++){
-            U[i*n+j]=tmp_U[i*m+j];
+    gsl_matrix *tmp_src;
+    gsl_matrix *tmp_V;
+    gsl_vector *tmp_s;
+    gsl_vector *_tmp_vec;
+    tmp_src = gsl_matrix_alloc(n,m);
+    for ( int row = 0; row < n; row++ ) { 
+        for ( int col = 0; col < m; col++ ) { 
+            gsl_matrix_set(tmp_src, row, col, src[row*m+col]);
         }
     }
+    tmp_V = gsl_matrix_alloc(m, m);
+	tmp_s = gsl_vector_alloc(m);
+	_tmp_vec = gsl_vector_alloc(m);
+	gsl_linalg_SV_decomp(tmp_src, tmp_V, tmp_s, _tmp_vec);
+	gsl_vector_free(_tmp_vec);
 
-    CHECK(cudaFree(devInfo));
-    CHECK(cudaFree(work));
-    CHECK(cudaFree(tmp_U));
-    cusolveSafeCall(cusolverDnDestroy(solver_handle));
-    cusolveSafeCall(cusolverDnDestroyGesvdjInfo(gesvdj_params));
-  
+    
+    for ( int row = 0; row < n; row++ ) { 
+        for ( int col = 0; col < m; col++ ) { 
+            src[row*n+col] = gsl_matrix_get(tmp_src, row, col);
+        }
+    }
+    gsl_matrix_free(tmp_src);
 
+    for ( int row = 0; row < m; row++ ) { 
+        for ( int col = 0; col < m; col++ ) { 
+            V[row*m+col] = gsl_matrix_get(tmp_V, row, col);
+        }
+        s[row] = gsl_vector_get(tmp_s, row);
+    }
+
+    gsl_matrix_free(tmp_V);
+    gsl_vector_free(tmp_s);
+	
     /* compute Σ⁻¹ */
     CHECK(cudaMallocManaged(&Sigma_pinv, m*n*sizeof(float)));
     CHECK(cudaMemset(Sigma_pinv, 0.0, m*n*sizeof(float)));
@@ -309,6 +302,16 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
         Sigma_pinv[i*n+i] = x;
 	}
 
+	/*libgsl SVD yields "thin" SVD - pad to full matrix by adding zeros */
+    CHECK(cudaMallocManaged(&U,n*n*sizeof(float)));
+    CHECK(cudaMemset(U,0,n*n*sizeof(float)));
+
+    for(int i = 0; i<n; i++){
+        for(int j=0; j<m; j++){
+            U[i*n+j]=src[i*n+j];
+        }
+    }
+
 	/* two dot products to obtain pseudoinverse */
     CHECK(cudaMallocManaged(&_tmp_mat,m*n*sizeof(float)));
 
@@ -320,25 +323,24 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
     CHECK(cudaDeviceSynchronize());
 
 	if (was_swapped) {
-		transposeSmem<<<gridShared,blockShared, SMEMbyte>>>(_tmp_mat, src, m,n);
+		transposeSmem<<<gridShared,blockShared>>>(_tmp_mat, src, m,n);
         CHECK(cudaDeviceSynchronize());
-        
+
         for (int i=0; i< NSTREAM; i++){
             int ioffset = i*iElem;
             matrixMultStream<<<grid2St, blockShared, 0, stream[i]>>>(U,src,dst,n,n,m, ioffset);
         }
-
         CHECK(cudaDeviceSynchronize());
 	}
 	else {
         float *tmp_U;
         CHECK(cudaMallocManaged(&tmp_U, n*n*sizeof(float)));
-		
+
         gridShared.y = (n + blockShared.y - 1) / blockShared.y;
         gridShared.x = (n+blockShared.x - 1) / blockShared.x;
-        transposeSmem<<<gridShared,blockShared, SMEMbyte>>>(U, tmp_U, n,n);
+        transposeSmem<<<gridShared,blockShared>>>(U, tmp_U, n,n);
         CHECK(cudaDeviceSynchronize());
-       
+
         for (int i=0; i< NSTREAM; i++){
             int ioffset = i*iElem;
             matrixMultStream<<<grid1St, blockShared, 0, stream[i]>>>(_tmp_mat,tmp_U,dst,m,n,n, ioffset);
@@ -349,6 +351,7 @@ void moore_penrose_pinv(float* src, float *dst, int dim1, int dim2){
 	}
     for (int i = 0; i < NSTREAM; ++i)
         CHECK(cudaStreamDestroy(stream[i]));
+
     CHECK(cudaFree(_tmp_mat));
     CHECK(cudaFree(U));
     CHECK(cudaFree(Sigma_pinv));
@@ -361,8 +364,6 @@ void createDict_CPU(int n, int m, int k, float *D, float *Dinv, float *s) {
 
     dim3 blockShared(SHAREDBLOCKSIZE, SHAREDBLOCKSIZE);
     dim3 gridShared;
-	uint SMEMsize = SHAREDBLOCKSIZE *SHAREDBLOCKSIZE;
-	uint SMEMbyte = 2 * SMEMsize * sizeof(float);
 
     int blockSize = 32;
 
@@ -372,7 +373,6 @@ void createDict_CPU(int n, int m, int k, float *D, float *Dinv, float *s) {
 
     for (int i = 0; i < NSTREAM; ++i)
         CHECK(cudaStreamCreate(&stream[i]));
-        //CHECK(cudaStreamCreateWithFlags(&stream[i],cudaStreamNonBlocking));
 
     srand(SEED);
    
@@ -398,8 +398,8 @@ void createDict_CPU(int n, int m, int k, float *D, float *Dinv, float *s) {
     CHECK(cudaDeviceSynchronize());
 
     thrust::sort_by_key(thrust::device, tmp_perm_index, tmp_perm_index + m, true_alpha);
-        
-    //create randoM dictionary
+
+    //create random dictionary
     curandState *devStates;
 	CHECK(cudaMalloc((void **) &devStates, n* m* sizeof(curandState)));
 
@@ -416,11 +416,10 @@ void createDict_CPU(int n, int m, int k, float *D, float *Dinv, float *s) {
    
     gridShared.y = (n + blockShared.y - 1) / blockShared.y;
     gridShared.x = (m+blockShared.x - 1) / blockShared.x;
-    transposeSmem<<<gridShared,blockShared, SMEMbyte>>>(D,D_transp, n, m);
+    transposeSmem<<<gridShared,blockShared>>>(D,D_transp, n, m);
     CHECK(cudaDeviceSynchronize());
-
+  
     float norm;
-
     for(int i = 0; i < m; i++){
         for(int z = 0; z<n; z++){
             norm_support[z]=D_transp[i*n+z];
@@ -433,10 +432,9 @@ void createDict_CPU(int n, int m, int k, float *D, float *Dinv, float *s) {
     }
 
     dim3 grid2((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
-
     gridShared.y = (n + blockShared.y - 1) / blockShared.y;
     gridShared.x = (m+blockShared.x - 1) / blockShared.x;
-    transposeSmem<<<gridShared,blockShared, SMEMbyte>>>(D_transp,D,m,n);
+    transposeSmem<<<gridShared,blockShared>>>(D_transp,D,m,n);
 	CHECK(cudaDeviceSynchronize());
     CHECK(cudaFree(norm_support));
 
@@ -458,16 +456,15 @@ void createDict_CPU(int n, int m, int k, float *D, float *Dinv, float *s) {
     
     CHECK(cudaFree(mat_D));
 
- 
+   
     dim3 grid1St ((iElem0/n+ blockShared.x - 1) / blockShared.x, (iElem0 + blockShared.y - 1) / blockShared.y);
-    //generating signal s
+
     for (int i=0; i< NSTREAM; i++){
         int ioffset = i*iElem0;
         matrixMultStream<<<grid1St, blockShared, 0, stream[i]>>>(D,true_alpha,s, n,m,1, ioffset);
     }
 
     CHECK(cudaDeviceSynchronize());
-
     for (int i = 0; i < NSTREAM; ++i)
         CHECK(cudaStreamDestroy(stream[i]));
 
@@ -483,8 +480,6 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
 	dim3 blockShared(SHAREDBLOCKSIZE, SHAREDBLOCKSIZE);
     dim3 blockShared2(SHAREDBLOCKSIZE*SHAREDBLOCKSIZE);
     dim3 gridShared;
-	uint SMEMsize = SHAREDBLOCKSIZE *SHAREDBLOCKSIZE;
-	uint SMEMbyte = 2 * SMEMsize * sizeof(float);
 
     uint blockSize = 32;
     dim3 block(blockSize, blockSize);
@@ -499,10 +494,10 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
 
     for (int i = 0; i < NSTREAM; ++i)
         CHECK(cudaStreamCreate(&stream[i]));
-        //CHECK(cudaStreamCreateWithFlags(&stream[i],cudaStreamNonBlocking));
 
     int iElem = (m%NSTREAM == 0) ? m/NSTREAM : m/ NSTREAM+1;
     int iElem2 =  (n%NSTREAM == 0) ? n/NSTREAM :n/NSTREAM+1;
+    
     dim3 grid1St ((iElem + block2.x - 1) / block2.x);
     dim3 grid2St((iElem2+block2.x-1)/block2.x);
 
@@ -513,7 +508,7 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
     gridShared.x = (1+blockShared.x - 1) / blockShared.x;
     
     int iElemM1 =  (m%NSTREAM == 0) ? m/NSTREAM : m/ NSTREAM+1;
- 
+
     int iElemTmp = ((m*n)%NSTREAM == 0) ? (m*n)/NSTREAM : (m*n)/ NSTREAM+1;
     dim3 grid1MSt ((iElemTmp/m+ blockShared.x - 1) / blockShared.x, (iElemTmp + blockShared.y - 1) / blockShared.y);
 
@@ -523,7 +518,7 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
     }
     CHECK(cudaDeviceSynchronize());
 
-    //I do the alpha transpose to make things easier, then I transpose again
+    //I do the alpha transpose to make things easier, then transpose again
     float *t_alpha;
     CHECK(cudaMallocManaged(&t_alpha, mSize));
     
@@ -556,6 +551,7 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
     dim3 grid2((n+blockSize2-1)/blockSize2);
     
     int iElemM2 =  (n%NSTREAM == 0) ? n/NSTREAM : n/ NSTREAM+1;
+
     dim3 grid2MSt ((iElemM2/n+ blockShared.x - 1) / blockShared.x, (iElemM2 + blockShared.y - 1) / blockShared.y);
 
     // CORE
@@ -567,13 +563,13 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
             abs_array<<<grid1St, block2, 0, stream[i]>>>(alpha,m, ioffset);
         }
         CHECK(cudaDeviceSynchronize());
-    
+
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem;
             array_initialize<<<grid1St,block2,0,stream[i]>>>(tmp_lambaMat,lambda, m, ioffset);
             array_initialize<<<grid1St,block2,0,stream[i]>>>(beta,float(1.0),m,ioffset);
         }
-
+            
         CHECK(cudaDeviceSynchronize());
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem;
@@ -584,14 +580,14 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
             int ioffset = i * iElem;
             arr_preProc<<<grid1St, block2, 0, stream[i]>>>(alpha, m, ioffset);
         }   
-        CHECK(cudaDeviceSynchronize());
-        
+        CHECK(cudaDeviceSynchronize()); 
+      
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem;
             matrixDiff<<<grid1St, block2, 0, stream[i]>>>(beta,alpha,beta, m, ioffset);
         }
         CHECK(cudaDeviceSynchronize());
-        
+    
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem;
             elemWise_mult<<<grid1St, block2, 0, stream[i]>>>(alphaold,beta, beta, m, ioffset);
@@ -599,20 +595,20 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
         
 
         CHECK(cudaDeviceSynchronize());
-
+    
         for (int i=0; i< NSTREAM; i++){
             int ioffset = i*iElemM2;
             matrixMultStream<<<grid2MSt, blockShared, 0, stream[i]>>>(D, beta, tmp_d_beta, n,m,1,ioffset);
         }
 
         CHECK(cudaDeviceSynchronize());
-
+     
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem2;
             matrixDiff<<<grid2St, block2, 0, stream[i]>>>(tmp_d_beta,s, tmp_d_beta, n, ioffset);
         }
         CHECK(cudaDeviceSynchronize());
-
+        
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElemM1;
             matrixMultStream<<<grid1St, blockShared,0, stream[i]>>>(Dinv, tmp_d_beta, tmp_dinv_dBetaS, m,n,1,ioffset);
@@ -637,16 +633,14 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
 
 
         lambda = 1/t_alpha[(m-1)-k];
-    
-        
+      
         for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem;
             matrixDiff<<<grid1St, block2, 0,stream[i]>>>(alpha, alphaold, alphaold, m, ioffset);
         }
-        // check the stopping criteria
         
         CHECK(cudaDeviceSynchronize());
-
+        // check the stopping criteria
         if (euclNorm(alphaold, m)<epsilon|| isnan(lambda)){
             printf("eucl norm: %f\n",euclNorm(alphaold,m));
             printf("Lambda: %f\n",lambda);
@@ -659,7 +653,7 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
     CHECK(cudaFree(tmp_dinv_dBetaS));
     CHECK(cudaFree(t_alpha));
     CHECK(cudaFree(tmp_lambaMat));
-  
+ 
     // FINAL REFINEMENTS FOR SOLUTION
 
     //I'll use beta again just to not allocating another useless variable
@@ -699,41 +693,41 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
 
     gridShared.y = (n + blockShared.y - 1) / blockShared.y;
     gridShared.x = (m+blockShared.x - 1) / blockShared.x;
-    transposeSmem<<<gridShared, blockShared, SMEMbyte>>>(D,D_transp,n,m); 
+    transposeSmem<<<gridShared, blockShared>>>(D,D_transp,n,m); 
     CHECK(cudaDeviceSynchronize());
     
     dim3 grid4((n + block.x - 1) / block.x, (k + block.y - 1) / block.y);
-    
+
     subMatrix<<<grid4, block>>>(D1_transp,D_transp, idx_array,k,n);
     CHECK(cudaDeviceSynchronize());
     
     gridShared.y = (k + blockShared.y - 1) / blockShared.y;
     gridShared.x = (n+blockShared.x - 1) / blockShared.x;
-    transposeSmem<<<gridShared, blockShared, SMEMbyte>>>(D1_transp,D1, k,n);
+    transposeSmem<<<gridShared, blockShared>>>(D1_transp,D1, k,n);
     CHECK(cudaDeviceSynchronize());
-    
+
+    // alpha(idx) = alpha(idx) - pinv(D1)*(D1*alpha(idx)-s);
     float *tmp_d1_alpha_mul;
     float *D1_pinv;
     float *tmp_pinvD1_par;
     CHECK(cudaMallocManaged(&tmp_d1_alpha_mul, nSize));
     CHECK(cudaMallocManaged(&D1_pinv, kSize*nSize));
     CHECK(cudaMallocManaged(&tmp_pinvD1_par, kSize));
-
     
     for (int i = 0; i < NSTREAM; ++i) {
         int ioffset = i * iElem2;
         matrixMultStream<<<grid2MSt, blockShared, 0, stream[i]>>>(D1, sel_alpha, tmp_d1_alpha_mul, n,k,1,ioffset);
     }        
-
-    CHECK(cudaDeviceSynchronize()); 
     
+    CHECK(cudaDeviceSynchronize()); 
+
     for (int i = 0; i < NSTREAM; ++i) {
             int ioffset = i * iElem2;
             matrixDiff<<<grid2St, block2, 0,stream[i]>>>(tmp_d1_alpha_mul, s,tmp_d1_alpha_mul,n, ioffset);
     }
     
     CHECK(cudaDeviceSynchronize());
-
+    
     float *mat_D1;
     CHECK(cudaMallocManaged(&mat_D1,n*k));
 
@@ -744,14 +738,13 @@ void k_limaps(int n, int m, int k, float *s, float *D, float *Dinv, float *alpha
         int ioffset = i*iElem0;
         copy_matrix<<<grid0MSt, blockShared, 0,stream[i]>>>(D1,mat_D1,n,k, ioffset);
     }
-
+  
     CHECK(cudaDeviceSynchronize());
     
     moore_penrose_pinv(mat_D1, D1_pinv, n, k);
     CHECK(cudaDeviceSynchronize());
- 
     CHECK(cudaFree(mat_D1));
-  
+
     int iElem6 = k/NSTREAM+1;
     dim3 grid6St((iElem6+blockSize2-1)/blockSize2);
     
@@ -814,7 +807,6 @@ int main(int argc, char *argv[]) {
 
     cudaEventCreate(&start);
     cudaEventRecord(start,0);
- 
 
     createDict_CPU(N,M,K,D,Dinv, s);
     k_limaps(N, M, K, s,D, Dinv, alpha);
@@ -825,8 +817,6 @@ int main(int argc, char *argv[]) {
     printf("The resulting alpha is:\n");
     matrixDisplay(alpha, M,1);
     printf("\n\nTotal time in GPU: %f ms \n\n", cuTime);
-
-
 
     CHECK(cudaFree(D));
     CHECK(cudaFree(Dinv));

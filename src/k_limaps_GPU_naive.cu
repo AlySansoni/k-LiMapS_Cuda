@@ -5,7 +5,7 @@
 #include <math.h>
 #include <cuda.h>
 #include <curand_kernel.h>
-#include "utils/common.h"
+#include "../utils/common.h"
 //#include <gsl/gsl_blas.h>
 //#include <gsl/gsl_linalg.h>
 #include <thrust/device_vector.h>
