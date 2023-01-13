@@ -1,3 +1,7 @@
+#Project
+
+This Project was done at University of Milan for the exam "GPU Computing"
+
 # k-LiMapS_Cuda
 Implementation and enhancement of k-LiMapS algorithm using Cuda tools
 Input sizes (M,N,K, maxIter) can be modified opening each algorithm version and changed their defined values at the beginning of the code. 
